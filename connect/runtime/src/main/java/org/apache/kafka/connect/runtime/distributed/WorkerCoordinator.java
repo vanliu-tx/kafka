@@ -23,7 +23,6 @@ import org.apache.kafka.common.metrics.MetricConfig;
 import org.apache.kafka.common.metrics.Metrics;
 import org.apache.kafka.common.requests.JoinGroupRequest;
 import org.apache.kafka.common.requests.JoinGroupRequest.ProtocolMetadata;
-import org.apache.kafka.common.utils.CircularIterator;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.connect.storage.ConfigBackingStore;
 import org.apache.kafka.connect.util.ConnectorTaskId;
@@ -206,43 +205,86 @@ public final class WorkerCoordinator extends AbstractCoordinator implements Clos
     }
 
     private Map<String, ByteBuffer> performTaskAssignment(String leaderId, long maxOffset, Map<String, ConnectProtocol.WorkerState> memberConfigs) {
+        // 将参与分配的worker排序,按照resturl进行排序
+        Map<String, String> urlToMemberId = new HashMap<>();
+        for (String key : memberConfigs.keySet()) {
+            urlToMemberId.put(memberConfigs.get(key).url(), key);
+        }
+        List<String> orderedUrl = sorted(urlToMemberId.keySet());
+        List<String> members = new ArrayList<>();
+        for (String url : orderedUrl) {
+            members.add(urlToMemberId.get(url));
+        }
+
+        // 初始化分配队列
         Map<String, List<String>> connectorAssignments = new HashMap<>();
         Map<String, List<ConnectorTaskId>> taskAssignments = new HashMap<>();
-
-        // Perform round-robin task assignment. Assign all connectors and then all tasks because assigning both the
-        // connector and its tasks can lead to very uneven distribution of work in some common cases (e.g. for connectors
-        // that generate only 1 task each; in a cluster of 2 or an even # of nodes, only even nodes will be assigned
-        // connectors and only odd nodes will be assigned tasks, but tasks are, on average, actually more resource
-        // intensive than connectors).
-        List<String> connectorsSorted = sorted(configSnapshot.connectors());
-        CircularIterator<String> memberIt = new CircularIterator<>(sorted(memberConfigs.keySet()));
-        for (String connectorId : connectorsSorted) {
-            String connectorAssignedTo = memberIt.next();
-            log.trace("Assigning connector {} to {}", connectorId, connectorAssignedTo);
-            List<String> memberConnectors = connectorAssignments.get(connectorAssignedTo);
-            if (memberConnectors == null) {
-                memberConnectors = new ArrayList<>();
-                connectorAssignments.put(connectorAssignedTo, memberConnectors);
-            }
-            memberConnectors.add(connectorId);
+        for (String memberId : members) {
+            connectorAssignments.put(memberId, new ArrayList<String>());
+            taskAssignments.put(memberId, new ArrayList<ConnectorTaskId>());
         }
-        for (String connectorId : connectorsSorted) {
-            for (ConnectorTaskId taskId : sorted(configSnapshot.tasks(connectorId))) {
-                String taskAssignedTo = memberIt.next();
-                log.trace("Assigning task {} to {}", taskId, taskAssignedTo);
-                List<ConnectorTaskId> memberTasks = taskAssignments.get(taskAssignedTo);
-                if (memberTasks == null) {
-                    memberTasks = new ArrayList<>();
-                    taskAssignments.put(taskAssignedTo, memberTasks);
+
+        // 先分配connector，然后分配task，在task中，单task和connector分配在同一worker上,多task分配和connector分配策略相同
+        // 分配策略，比如有5个connector，3个member，则分配为[0,1],[2,3],[4]，2个member时，分配为[0,1,2],[3,4]
+        // 这个策略无论增删connector，无论connector所在位置，整个集群变化最小
+        List<String> connectors = sorted(configSnapshot.connectors());
+        List<Integer> connNumbers = splitIntoSegements(connectors.size(), members.size());
+        int startIndex = 0;
+        for (int i = 0; i < connNumbers.size(); i++) {
+            String connectorAssignedTo = members.get(i);
+            int connNum = connNumbers.get(i);
+            List<String> memberConnectors = connectorAssignments.get(connectorAssignedTo);
+            memberConnectors.addAll(connectors.subList(startIndex, startIndex + connNum));
+            // 分配tasks
+            for (String connectorId : connectors.subList(startIndex, startIndex + connNum)) {
+                // 修改简单的轮询分配策略,当单个connector下的task数量比较多时,使用分区分配策略
+                List<ConnectorTaskId> tasks = sorted(configSnapshot.tasks(connectorId));
+                if (tasks.size() == 1) {
+                    taskAssignments.get(members.get(i)).add(tasks.get(0));
+                } else if (tasks.size() > 1) {
+                    List<Integer> taskNumbers = splitIntoSegements(tasks.size(), members.size());
+                    int start = 0;
+                    for (int j = 0; j < taskNumbers.size(); j++) {
+                        String taskAssignedTo = members.get(j);
+                        int taskNum = taskNumbers.get(j);
+                        List<ConnectorTaskId> memberTasks = taskAssignments.get(taskAssignedTo);
+                        memberTasks.addAll(tasks.subList(start, start + taskNum));
+                        start += taskNum;
+                    }
+                } else {
+                    log.warn("no task to assign for connector {}!", connectorId);
                 }
-                memberTasks.add(taskId);
             }
+            startIndex += connNum;
         }
 
         this.leaderState = new LeaderState(memberConfigs, connectorAssignments, taskAssignments);
 
         return fillAssignmentsAndSerialize(memberConfigs.keySet(), ConnectProtocol.Assignment.NO_ERROR,
                 leaderId, memberConfigs.get(leaderId).url(), maxOffset, connectorAssignments, taskAssignments);
+    }
+
+    /**
+     * 将total个对象分配到segements个数的片段中,按顺序进行分配,
+     * 尽量平均分配,当无法均分时,保证排在前面的分配的更多。
+     * @param total      对象个数
+     * @param segements  拆分的片段数量
+     * @return  包含每个片段中包含数量的数组
+     */
+    private List<Integer> splitIntoSegements(int total, int segements) {
+        List<Integer> result = new ArrayList<>(segements);
+        if (total <= segements) {
+            for (int i = 0; i < total; i++) {
+                result.add(1); // 一个分区一个元素
+            }
+        } else {
+            for (int i = 0; i < segements; i++) {
+                int count = (total / segements) + (total % segements > i ? 1 : 0);
+                result.add(i, count);
+            }
+        }
+
+        return result;
     }
 
     private Map<String, ByteBuffer> fillAssignmentsAndSerialize(Collection<String> members,

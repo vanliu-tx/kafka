@@ -197,9 +197,14 @@ public abstract class AbstractHerder implements Herder, TaskStatus.Listener, Con
                 connector.state().toString(), connector.workerId(), connector.trace());
         List<ConnectorStateInfo.TaskState> taskStates = new ArrayList<>();
 
+        // task的数量可能有变化，从少变多或者从多变少。对于从多变少的场景，目前的实现会导致status中
+        // 的task数量没有减少，仅仅是任务状态变成了UNASSIGNED。这里需要从config中获取实际的task数量。
+        int taskNum = configBackingStore.getTaskNum(connName);
         for (TaskStatus status : tasks) {
-            taskStates.add(new ConnectorStateInfo.TaskState(status.id().task(),
+            if (status.id().task() < taskNum) {
+                taskStates.add(new ConnectorStateInfo.TaskState(status.id().task(),
                     status.state().toString(), status.workerId(), status.trace()));
+            }
         }
 
         Collections.sort(taskStates);

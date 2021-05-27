@@ -373,14 +373,14 @@ public class WorkerCoordinatorTest {
         assertEquals("leader", leaderAssignment.leader());
         assertEquals(1, leaderAssignment.offset());
         assertEquals(Collections.singletonList(connectorId1), leaderAssignment.connectors());
-        assertEquals(Collections.emptyList(), leaderAssignment.tasks());
+        assertEquals(Collections.singletonList(taskId1x0), leaderAssignment.tasks());
 
         ConnectProtocol.Assignment memberAssignment = ConnectProtocol.deserializeAssignment(result.get("member"));
         assertEquals(false, memberAssignment.failed());
         assertEquals("leader", memberAssignment.leader());
         assertEquals(1, memberAssignment.offset());
         assertEquals(Collections.emptyList(), memberAssignment.connectors());
-        assertEquals(Collections.singletonList(taskId1x0), memberAssignment.tasks());
+        assertEquals(Collections.emptyList(), memberAssignment.tasks());
 
         PowerMock.verifyAll();
     }
@@ -409,14 +409,14 @@ public class WorkerCoordinatorTest {
         assertEquals("leader", leaderAssignment.leader());
         assertEquals(1, leaderAssignment.offset());
         assertEquals(Collections.singletonList(connectorId1), leaderAssignment.connectors());
-        assertEquals(Arrays.asList(taskId1x0, taskId2x0), leaderAssignment.tasks());
+        assertEquals(Collections.singletonList(taskId1x0), leaderAssignment.tasks());
 
         ConnectProtocol.Assignment memberAssignment = ConnectProtocol.deserializeAssignment(result.get("member"));
         assertEquals(false, memberAssignment.failed());
         assertEquals("leader", memberAssignment.leader());
         assertEquals(1, memberAssignment.offset());
         assertEquals(Collections.singletonList(connectorId2), memberAssignment.connectors());
-        assertEquals(Collections.singletonList(taskId1x1), memberAssignment.tasks());
+        assertEquals(Arrays.asList(taskId2x0, taskId1x1), memberAssignment.tasks());
 
         PowerMock.verifyAll();
     }
@@ -445,15 +445,15 @@ public class WorkerCoordinatorTest {
         assertEquals(false, leaderAssignment.failed());
         assertEquals("leader", leaderAssignment.leader());
         assertEquals(1, leaderAssignment.offset());
-        assertEquals(Arrays.asList(connectorId1, connectorId3), leaderAssignment.connectors());
-        assertEquals(Arrays.asList(taskId2x0), leaderAssignment.tasks());
+        assertEquals(Arrays.asList(connectorId1, connectorId2), leaderAssignment.connectors());
+        assertEquals(Arrays.asList(taskId1x0, taskId2x0), leaderAssignment.tasks());
 
         ConnectProtocol.Assignment memberAssignment = ConnectProtocol.deserializeAssignment(result.get("member"));
         assertEquals(false, memberAssignment.failed());
         assertEquals("leader", memberAssignment.leader());
         assertEquals(1, memberAssignment.offset());
-        assertEquals(Collections.singletonList(connectorId2), memberAssignment.connectors());
-        assertEquals(Arrays.asList(taskId1x0, taskId3x0), memberAssignment.tasks());
+        assertEquals(Collections.singletonList(connectorId3), memberAssignment.connectors());
+        assertEquals(Arrays.asList(taskId3x0), memberAssignment.tasks());
 
         PowerMock.verifyAll();
     }

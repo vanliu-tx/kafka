@@ -281,6 +281,13 @@ public class KafkaConfigBackingStore implements ConfigBackingStore {
         }
     }
 
+    @Override
+    public int getTaskNum(String connector) {
+        synchronized (lock) {
+            return connectorTaskCounts.containsKey(connector) ? connectorTaskCounts.get(connector) : 0;
+        }
+    }
+
     /**
      * Write this connector configuration to persistent storage and wait until it has been acknowledged and read back by
      * tailing the Kafka log with a consumer.
@@ -594,7 +601,8 @@ public class KafkaConfigBackingStore implements ConfigBackingStore {
                     } else {
                         if (deferred != null) {
                             taskConfigs.putAll(deferred);
-                            updatedTasks.addAll(taskConfigs.keySet());
+                            // 仅仅记录受到影响的tasks
+                            updatedTasks.addAll(deferred.keySet());
                         }
                         inconsistent.remove(connectorName);
                     }
@@ -604,9 +612,11 @@ public class KafkaConfigBackingStore implements ConfigBackingStore {
                     if (deferred != null)
                         deferred.clear();
 
+                    log.info("going to set connector {} task count to {}", connectorName, newTaskCount);
                     connectorTaskCounts.put(connectorName, newTaskCount);
                 }
 
+                // 当收到任务commit消息时，触发task配置更新，从而引发任务rebalance
                 if (started)
                     updateListener.onTaskConfigUpdate(updatedTasks);
             } else {

@@ -29,10 +29,12 @@ import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.errors.NotFoundException;
 import org.apache.kafka.connect.runtime.AbstractHerder;
 import org.apache.kafka.connect.runtime.ConnectorConfig;
+import org.apache.kafka.connect.runtime.ConnectorStatus;
 import org.apache.kafka.connect.runtime.HerderConnectorContext;
 import org.apache.kafka.connect.runtime.SinkConnectorConfig;
 import org.apache.kafka.connect.runtime.SourceConnectorConfig;
 import org.apache.kafka.connect.runtime.TargetState;
+import org.apache.kafka.connect.runtime.TaskStatus;
 import org.apache.kafka.connect.runtime.Worker;
 import org.apache.kafka.connect.runtime.rest.RestServer;
 import org.apache.kafka.connect.runtime.rest.entities.ConfigInfos;
@@ -52,6 +54,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.NavigableSet;
@@ -59,14 +62,17 @@ import java.util.NoSuchElementException;
 import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentSkipListSet;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -102,7 +108,8 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
     private static final Logger log = LoggerFactory.getLogger(DistributedHerder.class);
 
     private static final long RECONFIGURE_CONNECTOR_TASKS_BACKOFF_MS = 250;
-    private static final int START_STOP_THREAD_POOL_SIZE = 8;
+    // 扩大并发启停任务的线程池
+    private static final int START_STOP_THREAD_POOL_SIZE = 64;
 
     private final AtomicLong requestSeqNum = new AtomicLong();
 
@@ -135,6 +142,8 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
     // Similarly collect target state changes (when observed by the config storage listener) for handling in the
     // herder's main thread.
     private Set<String> connectorTargetStateChanges = new HashSet<>();
+    // 用于记录被删除了的connector
+    private Set<String> connectorsRemoved = new HashSet<>();
     private boolean needsReconfigRebalance;
     private volatile int generation;
 
@@ -173,7 +182,7 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
                     }
                 });
         this.forwardRequestExecutor = Executors.newSingleThreadExecutor();
-        this.startAndStopExecutor = Executors.newFixedThreadPool(START_STOP_THREAD_POOL_SIZE);
+        this.startAndStopExecutor = Executors.newFixedThreadPool(START_STOP_THREAD_POOL_SIZE, new NamedThreadFactory("Herder"));
 
         stopping = new AtomicBoolean(false);
         configState = ClusterConfigState.EMPTY;
@@ -268,6 +277,14 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
                     // Task reconfigs require a rebalance. Request the rebalance, clean out state, and then restart
                     // this loop, which will then ensure the rebalance occurs without any other requests being
                     // processed until it completes.
+                    // 当connector被删除时，此时对应的task并未被停止。应该先停止对应的task，然后触发rebalance，
+                    // 否则会出现connector不存在了，task还在继续运行的问题
+                    if (!connectorsRemoved.isEmpty()) {
+                        Set<String> removedConnectors = connectorsRemoved;
+                        connectorsRemoved = new HashSet<>();
+                        processConnectorRemoves(removedConnectors);
+                    }
+
                     member.requestRejoin();
                     // Any connector config updates or target state changes will be addressed during the rebalance too
                     connectorConfigUpdates.clear();
@@ -309,6 +326,23 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
         }
     }
 
+    /**
+     * 处理connector被删除的场景，将其对应的task全部停止掉
+     * @param removedConnectors 被删除的connector集合
+     */
+    private void processConnectorRemoves(Set<String> removedConnectors) {
+        List<Callable<Void>> callables = new ArrayList<>();
+        for (ConnectorTaskId taskId : assignment.tasks()) {
+            if (removedConnectors.contains(taskId.connector())) {
+                log.debug("{} going to stop task {} as its connector is removed!", worker.workerId(), taskId);
+                callables.add(getTaskStoppingCallable(taskId));
+            }
+        }
+
+        startAndStop(callables, true); // 并发停止任务
+        statusBackingStore.flush(); // 刷新kafka中存储的状态
+    }
+
     private void processConnectorConfigUpdates(Set<String> connectorConfigUpdates) {
         // If we only have connector config updates, we can just bounce the updated connectors that are
         // currently assigned to this worker.
@@ -317,7 +351,7 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
             if (!localConnectors.contains(connectorName))
                 continue;
             boolean remains = configState.contains(connectorName);
-            log.info("Handling connector-only config update by {} connector {}",
+            log.info("{} Handling connector-only config update by {} connector {}", worker.workerId(),
                     remains ? "restarting" : "stopping", connectorName);
             worker.stopConnector(connectorName);
             // The update may be a deletion, so verify we actually need to restart the connector
@@ -330,7 +364,7 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
         for (String connector : connectorTargetStateChanges) {
             TargetState targetState = configState.targetState(connector);
             if (!configState.connectors().contains(connector)) {
-                log.debug("Received target state change for unknown connector: {}", connector);
+                log.debug("{} Received target state change for unknown connector: {}", worker.workerId(), connector);
                 continue;
             }
 
@@ -349,7 +383,7 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
     public void halt() {
         synchronized (this) {
             // Clean up any connectors and tasks that are still running.
-            log.info("Stopping connectors and tasks that are still assigned to this worker.");
+            log.info("{} Stopping connectors and tasks that are still assigned to this worker.", worker.workerId());
             List<Callable<Void>> callables = new ArrayList<>();
             for (String connectorName : new ArrayList<>(worker.connectorNames())) {
                 callables.add(getConnectorStoppingCallable(connectorName));
@@ -357,7 +391,7 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
             for (ConnectorTaskId taskId : new ArrayList<>(worker.taskIds())) {
                 callables.add(getTaskStoppingCallable(taskId));
             }
-            startAndStop(callables);
+            startAndStop(callables, true);
 
             member.stop();
 
@@ -381,7 +415,7 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
         member.wakeup();
         herderExecutor.shutdown();
         try {
-            if (!herderExecutor.awaitTermination(workerTasksShutdownTimeoutMs, TimeUnit.MILLISECONDS))
+            if (!herderExecutor.awaitTermination(workerTasksShutdownTimeoutMs * 3, TimeUnit.MILLISECONDS))
                 herderExecutor.shutdownNow();
 
             forwardRequestExecutor.shutdown();
@@ -470,8 +504,10 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
                         if (!configState.contains(connName)) {
                             callback.onCompletion(new NotFoundException("Connector " + connName + " not found"), null);
                         } else {
-                            log.trace("Removing connector config {} {}", connName, configState.connectors());
+                            log.debug("Removing connector config {} {}", connName, configState.connectors());
                             configBackingStore.removeConnectorConfig(connName);
+                            // 删除connector配置时，同时将task的配置置为空，使task数量变为0
+                            configBackingStore.putTaskConfigs(connName, new ArrayList<Map<String, String>>());
                             callback.onCompletion(null, new Created<ConnectorInfo>(false, null));
                         }
                         return null;
@@ -806,9 +842,18 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
         Utils.sleep(ms);
     }
 
-    private void startAndStop(Collection<Callable<Void>> callables) {
+    private void startAndStop(Collection<Callable<Void>> callables, boolean waitFinish) {
         try {
-            startAndStopExecutor.invokeAll(callables);
+            List<Future<Void>> futures = startAndStopExecutor.invokeAll(callables);
+            if (waitFinish) {
+                for (Future<Void> future : futures) {
+                    try {
+                        future.get();
+                    } catch (ExecutionException ee) {
+                        log.warn("failed to execute start/stop task!", ee);
+                    }
+                }
+            }
         } catch (InterruptedException e) {
             // ignore
         }
@@ -816,21 +861,109 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
 
     private void startWork() {
         // Start assigned connectors and tasks
-        log.info("Starting connectors and tasks using config offset {}", assignment.offset());
-        List<Callable<Void>> callables = new ArrayList<>();
-        for (String connectorName : assignment.connectors()) {
-            callables.add(getConnectorStartingCallable(connectorName));
-        }
+        log.info("{} Start work using config offset {}", worker.workerId(), assignment.offset());
 
-        for (ConnectorTaskId taskId : assignment.tasks()) {
-            callables.add(getTaskStartingCallable(taskId));
+        // 找到在assignment中，但是没有在worker上的任务，将其启动
+        Set<String> connectors = new HashSet<>(assignment.connectors());
+        connectors.removeAll(worker.connectorNames());
+        Set<ConnectorTaskId> taskIds = new HashSet<>(assignment.tasks());
+        taskIds.removeAll(worker.taskIds());
+
+        if (!(connectors.isEmpty() && taskIds.isEmpty())) {
+            waitAndStartWork(connectors, taskIds, workerTasksShutdownTimeoutMs + 5000, 500);
+            statusBackingStore.flush();
         }
-        startAndStop(callables);
-        log.info("Finished starting connectors and tasks");
+        // TODO 这里考虑将worker上所有的connector和task状态刷新一遍，写入status的存储中
+        log.info("{} after startWork, connectors and tasks are {} and {}", worker.workerId(), worker.connectorNames(), worker.taskIds());
     }
 
+    private void waitAndStartWork(Set<String> connectors, Set<ConnectorTaskId> tasks, long timeout, long retryInterval) {
+        // connector和task之前可能在别的worker上运行，虽然已经调用了stop，但是可能还在等待stop的结果，
+        // status并没有更新，此时不能启动对应的connector和task，需等待status中状态改变为非RUNNING状态后再启动
+        log.info("{} starting connectors {} and tasks {} with timeout/interval {}/{}", worker.workerId(), connectors, tasks, timeout, retryInterval);
+        long now = System.currentTimeMillis();
+
+        while (System.currentTimeMillis() - now < timeout) {
+            List<Callable<Void>> callables = new ArrayList<>();
+            for (Iterator<String> iter = connectors.iterator(); iter.hasNext();) {
+                String connector = iter.next();
+                if (isGoodToStartConnector(connector)) {
+                    callables.add(getConnectorStartingCallable(connector));
+                    iter.remove();
+                }
+            }
+
+            // 优先启动connector，确保connector先于task启动，并等待connector启动完毕
+            if (!callables.isEmpty()) {
+                startAndStop(callables, true);
+                callables = new ArrayList<>();
+            }
+
+            for (Iterator<ConnectorTaskId> iter = tasks.iterator(); iter.hasNext();) {
+                ConnectorTaskId taskId = iter.next();
+                if (isGoodToStartTask(taskId)) {
+                    callables.add(getTaskStartingCallable(taskId));
+                    iter.remove();
+                }
+            }
+
+            // 触发task启动
+            if (!callables.isEmpty()) {
+                startAndStop(callables, false);
+            }
+
+            // 当部分任务暂时无法启动时，等待一会进入下一轮
+            if (connectors.isEmpty() && tasks.isEmpty()) {
+                break;
+            } else {
+                // 稍作等待
+                backoff(retryInterval);
+            }
+        }
+
+        // 如果仍然有任务未处理完，则强制启动
+        if (connectors.size() > 0 || tasks.size() > 0) {
+            log.debug("{} force starting connectors {} and tasks {}", worker.workerId(), connectors, tasks);
+            List<Callable<Void>> callables = new ArrayList<>();
+            for (String connector : connectors) {
+                callables.add(getConnectorStartingCallable(connector));
+            }
+            if (!callables.isEmpty()) {
+                startAndStop(callables, true);
+                callables = new ArrayList<>();
+            }
+            for (ConnectorTaskId task : tasks) {
+                callables.add(getTaskStartingCallable(task));
+            }
+            startAndStop(callables, false);
+        }
+    }
+
+
+    private boolean isGoodToStartConnector(String connectorName) {
+        ConnectorStatus status = statusBackingStore.get(connectorName);
+        if (status == null || status.state() != ConnectorStatus.State.RUNNING) {
+            return true;
+        } else {
+            log.info("{} connector is running on another worker {}, wait it to stop first", worker.workerId(), status);
+            return false;
+        }
+    }
+
+    private boolean isGoodToStartTask(ConnectorTaskId taskId) {
+        TaskStatus status = statusBackingStore.get(taskId);
+        if (status == null || status.state() != TaskStatus.State.RUNNING) {
+            return true;
+        } else {
+            log.info("{} task is running on another worker {}, wait it to stop first", worker.workerId(), status);
+            return false;
+        }
+    }
+
+
+
     private boolean startTask(ConnectorTaskId taskId) {
-        log.info("Starting task {}", taskId);
+        log.info("{} Starting task {}", worker.workerId(), taskId);
         return worker.startTask(
                 taskId,
                 configState.connectorConfig(taskId.connector()),
@@ -869,7 +1002,7 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
     // Helper for starting a connector with the given name, which will extract & parse the config, generate connector
     // context and add to the worker. This needs to be called from within the main worker thread for this herder.
     private boolean startConnector(String connectorName) {
-        log.info("Starting connector {}", connectorName);
+        log.info("{} Starting connector {}", worker.workerId(), connectorName);
         final Map<String, String> configProps = configState.connectorConfig(connectorName);
         final ConnectorContext ctx = new HerderConnectorContext(this, connectorName);
         final TargetState initialState = configState.targetState(connectorName);
@@ -975,7 +1108,7 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
                 int index = 0;
                 for (Map<String, String> taskConfig : taskProps) {
                     if (!taskConfig.equals(configState.taskConfig(new ConnectorTaskId(connName, index)))) {
-                        log.debug("Change in task configurations, writing updated task configurations");
+                        log.info("Change in task configurations, writing updated task configurations. {}, {}", new ConnectorTaskId(connName, index), taskConfig);
                         changed = true;
                         break;
                     }
@@ -1044,12 +1177,14 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
     public class ConfigUpdateListener implements ConfigBackingStore.UpdateListener {
         @Override
         public void onConnectorConfigRemove(String connector) {
-            log.info("Connector {} config removed", connector);
+            log.info("{} Connector {} config removed", worker.workerId(), connector);
 
             synchronized (DistributedHerder.this) {
                 // rebalance after connector removal to ensure that existing tasks are balanced among workers
-                if (configState.contains(connector))
+                if (configState.contains(connector)) {
                     needsReconfigRebalance = true;
+                    connectorsRemoved.add(connector);
+                }
                 connectorConfigUpdates.add(connector);
             }
             member.wakeup();
@@ -1057,7 +1192,7 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
 
         @Override
         public void onConnectorConfigUpdate(String connector) {
-            log.info("Connector {} config updated", connector);
+            log.info("{} Connector {} config updated", worker.workerId(), connector);
 
             // Stage the update and wake up the work thread. Connector config *changes* only need the one connector
             // to be bounced. However, this callback may also indicate a connector *addition*, which does require
@@ -1072,7 +1207,7 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
 
         @Override
         public void onTaskConfigUpdate(Collection<ConnectorTaskId> tasks) {
-            log.info("Tasks {} configs updated", tasks);
+            log.info("{} Tasks {} configs updated", worker.workerId(), tasks);
 
             // Stage the update and wake up the work thread. No need to record the set of tasks here because task reconfigs
             // always need a rebalance to ensure offsets get committed.
@@ -1086,7 +1221,7 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
 
         @Override
         public void onConnectorTargetStateChange(String connector) {
-            log.info("Connector {} target state change", connector);
+            log.info("{} Connector {} target state change", worker.workerId(), connector);
 
             synchronized (DistributedHerder.this) {
                 connectorTargetStateChanges.add(connector);
@@ -1138,7 +1273,7 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
         Set<String> connectors = snapshot.connectors();
         for (String connector : statusBackingStore.connectors()) {
             if (!connectors.contains(connector)) {
-                log.debug("Cleaning status information for connector {}", connector);
+                log.debug("{} Cleaning status information for connector {}", worker.workerId(), connector);
                 onDeletion(connector);
             }
         }
@@ -1153,7 +1288,49 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
             // catch up (or backoff if we fail) not executed in a callback, and so we'll be able to invoke other
             // group membership actions (e.g., we may need to explicitly leave the group if we cannot handle the
             // assigned tasks).
-            log.info("Joined group and got assignment: {}", assignment);
+            log.info("{} got assignment {} with generation {}", worker.workerId(), assignment, generation);
+
+            // 这里对比assignment中的connector/task 和 worker 中实际管理的connector/task，将assignment中不存在的都停掉
+            Set<String> connectorsToStop = new HashSet<>(10);
+            for (String connector : worker.connectorNames()) {
+                if (!assignment.connectors().contains(connector)) {
+                    connectorsToStop.add(connector);
+                } else {
+                    ConnectorStatus cs = statusBackingStore.get(connector);
+                    if (cs == null || cs.state().equals(ConnectorStatus.State.FAILED)) {
+                        // 对于在本worker上，包含在本次分配中的connector，如果状态为Failed的，将其先停止
+                        connectorsToStop.add(connector);
+                    }
+                }
+            }
+            Set<ConnectorTaskId> tasksToStop = new HashSet<>(10);
+            for (ConnectorTaskId taskId : worker.taskIds()) {
+                if (!assignment.tasks().contains(taskId)) {
+                    tasksToStop.add(taskId);
+                } else {
+                    TaskStatus ts = statusBackingStore.get(taskId);
+                    if (ts == null || ts.state().equals(TaskStatus.State.FAILED)) {
+                        // 对于在本worker上，包含在本次分配中的task，如果状态为Failed的，将其先停止
+                        tasksToStop.add(taskId);
+                    }
+                }
+            }
+
+            if (!(connectorsToStop.isEmpty() && tasksToStop.isEmpty())) {
+                log.info("{} stop connectors and tasks: {} {}", worker.workerId(), connectorsToStop, tasksToStop);
+                List<Callable<Void>> callables = new ArrayList<>();
+                for (final String connectorName : connectorsToStop) {
+                    callables.add(getConnectorStoppingCallable(connectorName));
+                }
+                for (final ConnectorTaskId taskId : tasksToStop) {
+                    callables.add(getTaskStoppingCallable(taskId));
+                }
+                // the actual timeout for graceful task stop is applied in worker's stopAndAwaitTask method
+                startAndStop(callables, false);
+            }
+            // 将任务状态变化刷到存储中，使其在各worker中同步
+            statusBackingStore.flush();
+
             synchronized (DistributedHerder.this) {
                 DistributedHerder.this.assignment = assignment;
                 DistributedHerder.this.generation = generation;
@@ -1174,7 +1351,7 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
 
         @Override
         public void onRevoked(String leader, Collection<String> connectors, Collection<ConnectorTaskId> tasks) {
-            log.info("Rebalance started");
+            log.info("{} Rebalance started. Leader/connectors/tasks: {}/{}/{}", worker.workerId(), leader, connectors.size(), tasks.size());
 
             // Note that since we don't reset the assignment, we we don't revoke leadership here. During a rebalance,
             // it is still important to have a leader that can write configs, offsets, etc.
@@ -1184,30 +1361,45 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
                 // this worker. Instead, we can let them continue to run but buffer any update requests (which should be
                 // rare anyway). This would avoid a steady stream of start/stop, which probably also includes lots of
                 // unnecessary repeated connections to the source/sink system.
-                List<Callable<Void>> callables = new ArrayList<>();
-                for (final String connectorName : connectors) {
-                    callables.add(getConnectorStoppingCallable(connectorName));
-                }
+
+                // revoke发生的时候,对当前worker上的connector和task暂时不做任何操作,等待assign的时候,对比两次assignmen的差异
+                // 对增删的connector和task进行操作。
 
                 // TODO: We need to at least commit task offsets, but if we could commit offsets & pause them instead of
                 // stopping them then state could continue to be reused when the task remains on this worker. For example,
                 // this would avoid having to close a connection and then reopen it when the task is assigned back to this
                 // worker again.
-                for (final ConnectorTaskId taskId : tasks) {
-                    callables.add(getTaskStoppingCallable(taskId));
-                }
-
-                // The actual timeout for graceful task stop is applied in worker's stopAndAwaitTask method.
-                startAndStop(callables);
 
                 // Ensure that all status updates have been pushed to the storage system before rebalancing.
                 // Otherwise, we may inadvertently overwrite the state with a stale value after the rebalance
                 // completes.
                 statusBackingStore.flush();
-                log.info("Finished stopping tasks in preparation for rebalance");
+                log.info("Finished preparation for rebalance");
             } else {
-                log.info("Wasn't unable to resume work after last rebalance, can skip stopping connectors and tasks");
+                log.info("Wasn't unable to resume work after last rebalance");
             }
+        }
+    }
+
+    public class NamedThreadFactory implements ThreadFactory {
+        private final AtomicInteger threadNumber = new AtomicInteger(1);
+        private final String namePrefix;
+
+        /**
+         * 构造函数
+         * @param prefix 线程的名称前缀
+         */
+        public NamedThreadFactory(String prefix) {
+            namePrefix = prefix;
+        }
+
+        /**
+         * 新建线程的方法
+         * @param r 可执行的runnable
+         * @return 一个线程
+         */
+        public Thread newThread(Runnable r) {
+            return new Thread(r, namePrefix + threadNumber.getAndIncrement());
         }
     }
 

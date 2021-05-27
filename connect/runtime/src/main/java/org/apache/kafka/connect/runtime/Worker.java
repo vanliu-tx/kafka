@@ -116,19 +116,19 @@ public class Worker {
      * Start worker.
      */
     public void start() {
-        log.info("Worker starting");
+        log.info("Worker starting: {}", workerId);
 
         offsetBackingStore.start();
         sourceTaskOffsetCommitter = new SourceTaskOffsetCommitter(config);
 
-        log.info("Worker started");
+        log.info("Worker started: {}", workerId);
     }
 
     /**
      * Stop worker.
      */
     public void stop() {
-        log.info("Worker stopping");
+        log.info("Worker stopping: {}", workerId);
 
         long started = time.milliseconds();
         long limit = started + config.getLong(WorkerConfig.TASK_SHUTDOWN_GRACEFUL_TIMEOUT_MS_CONFIG);
@@ -148,7 +148,7 @@ public class Worker {
 
         offsetBackingStore.stop();
 
-        log.info("Worker stopped");
+        log.info("Worker stopped: {}", workerId);
     }
 
     /**
@@ -175,7 +175,7 @@ public class Worker {
         try {
             final ConnectorConfig connConfig = new ConnectorConfig(connProps);
             final String connClass = connConfig.getString(ConnectorConfig.CONNECTOR_CLASS_CONFIG);
-            log.info("Creating connector {} of type {}", connName, connClass);
+            log.info("{} Creating connector {} of type {}. {}", workerId, connName, connClass, connProps);
             final Connector connector = connectorFactory.newConnector(connClass);
             workerConnector = new WorkerConnector(connName, connector, ctx, statusListener);
             log.info("Instantiated connector {} with version {} of type {}", connName, connector.version(), connector.getClass());
@@ -191,7 +191,7 @@ public class Worker {
         if (existing != null)
             throw new ConnectException("Connector with name " + connName + " already exists");
 
-        log.info("Finished creating connector {}", connName);
+        log.info("Finished creating connector {} by {}", connName, workerId);
         return true;
     }
 
@@ -251,17 +251,17 @@ public class Worker {
      * @return true if the connector belonged to this worker and was successfully stopped.
      */
     public boolean stopConnector(String connName) {
-        log.info("Stopping connector {}", connName);
+        log.info("Stopping connector {} by {}", connName, workerId);
 
         WorkerConnector connector = connectors.remove(connName);
         if (connector == null) {
-            log.warn("Ignoring stop request for unowned connector {}", connName);
+            log.warn("Ignoring stop request for unowned connector {} by {}", connName, workerId);
             return false;
         }
 
         connector.shutdown();
 
-        log.info("Stopped connector {}", connName);
+        log.info("Stopped connector {} by {}", connName, workerId);
         return true;
     }
 
@@ -302,7 +302,7 @@ public class Worker {
             TaskStatus.Listener statusListener,
             TargetState initialState
     ) {
-        log.info("Creating task {}", id);
+        log.info("{} Creating task {}. {} {}", workerId, id, connProps, taskProps);
 
         if (tasks.containsKey(id))
             throw new ConnectException("Task already exists in this worker: " + id);
@@ -376,11 +376,11 @@ public class Worker {
     private void stopTask(ConnectorTaskId taskId) {
         WorkerTask task = tasks.get(taskId);
         if (task == null) {
-            log.warn("Ignoring stop request for unowned task {}", taskId);
+            log.warn("Ignoring stop request for unowned task {} by {}", taskId, workerId);
             return;
         }
 
-        log.info("Stopping task {}", task.id());
+        log.info("Stopping task {} by {}", task.id(), workerId);
         if (task instanceof WorkerSourceTask)
             sourceTaskOffsetCommitter.remove(task.id());
         task.stop();
@@ -397,12 +397,12 @@ public class Worker {
     private void awaitStopTask(ConnectorTaskId taskId, long timeout) {
         WorkerTask task = tasks.remove(taskId);
         if (task == null) {
-            log.warn("Ignoring await stop request for non-present task {}", taskId);
+            log.warn("Ignoring await stop request for non-present task {} by {}", taskId, workerId);
             return;
         }
 
         if (!task.awaitStop(timeout)) {
-            log.error("Graceful stop of task {} failed.", task.id());
+            log.error("Graceful stop of task {} failed with timeout {} by {}.", task.id(), timeout, workerId);
             task.cancel();
         }
     }

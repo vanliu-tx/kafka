@@ -72,6 +72,11 @@ public class MemoryConfigBackingStore implements ConfigBackingStore {
     }
 
     @Override
+    public synchronized int getTaskNum(String connector) {
+        return 1;
+    }
+
+    @Override
     public synchronized void putConnectorConfig(String connector, Map<String, String> properties) {
         ConnectorState state = connectors.get(connector);
         if (state == null)

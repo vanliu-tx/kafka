@@ -47,6 +47,13 @@ public interface ConfigBackingStore {
     boolean contains(String connector);
 
     /**
+     * get the accurate task number of the connector
+     * @param connector name of the connector
+     * @return the task number of the connector
+     */
+    int getTaskNum(String connector);
+
+    /**
      * Update the configuration for a connector.
      * @param connector name of the connector
      * @param properties the connector configuration
