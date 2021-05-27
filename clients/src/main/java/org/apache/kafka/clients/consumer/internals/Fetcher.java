@@ -836,8 +836,13 @@ public class Fetcher<K, V> implements SubscriptionState.Listener {
 
         // we move the partition to the end if we received some bytes or if there was an error. This way, it's more
         // likely that partitions for the same topic can remain together (allowing for more efficient serialization).
-        if (bytes > 0 || error != Errors.NONE)
+        if (bytes > 0 || error != Errors.NONE) {
             subscriptions.movePartitionToEnd(tp);
+            if (error != Errors.NONE) {
+                // 当发生错误时，考虑backoff一段时间，避免形成调用风暴，retryBackoffMs默认值为100，可配
+                time.sleep(retryBackoffMs);
+            }
+        }
 
         return parsedRecords;
     }
