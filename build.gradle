@@ -142,6 +142,7 @@ subprojects {
                   authentication(userName: "${mavenUsername}", password: "${mavenPassword}")
               }
               afterEvaluate {
+                  pom.groupId = "com.tencent.bk.base.datahub"
                   pom.artifactId = "${archivesBaseName}"
                   pom.project {
                       name 'Apache Kafka'
