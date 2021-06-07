@@ -70,6 +70,7 @@ allprojects {
 ext {
   gradleVersion = "3.2.1"
   buildVersionFileName = "kafka-version.properties"
+  groupId = project.hasProperty('bkGroup') ? project.bkGroup : 'org.apache.kafka'
 
   maxPermSizeArgs = []
   if (!JavaVersion.current().isJava8Compatible())
@@ -142,7 +143,6 @@ subprojects {
                   authentication(userName: "${mavenUsername}", password: "${mavenPassword}")
               }
               afterEvaluate {
-                  pom.groupId = "com.tencent.bk.base.datahub"
                   pom.artifactId = "${archivesBaseName}"
                   pom.project {
                       name 'Apache Kafka'
@@ -168,9 +168,9 @@ subprojects {
                       }
 
                       scm {
-                          url = "https://github.com/vanliu-tx/kafka/tree/v0.10.2.0-bkbase.1"
-                          connection = "scm:git:https://github.com/vanliu-tx/kafka.git"
-                          developerConnection = "scm:git:git@github.com:vanliu-tx/kafka.git"
+                          url = "https://github.com/BKBASE-Plugin/kafka/tree/v0.10.2.0-bkbase.2"
+                          connection = "scm:git:https://github.com/BKBASE-Plugin/kafka.git"
+                          developerConnection = "scm:git:git@github.com:BKBASE-Plugin/kafka.git"
                       }
                   }
               }
@@ -400,6 +400,7 @@ tasks.create(name: "uploadArchivesAll", dependsOn: ['uploadCoreArchives_2_10', '
 project(':core') {
   println "Building project 'core' with Scala version ${versions.scala}"
 
+  group "${groupId}"
   apply plugin: 'scala'
   apply plugin: "org.scoverage"
   archivesBaseName = "kafka_${versions.baseScala}"
@@ -589,6 +590,7 @@ project(':core') {
 }
 
 project(':examples') {
+  group "${groupId}"
   archivesBaseName = "kafka-examples"
 
   dependencies {
@@ -605,6 +607,7 @@ project(':examples') {
 }
 
 project(':clients') {
+  group "${groupId}"
   archivesBaseName = "kafka-clients"
 
   dependencies {
@@ -676,6 +679,7 @@ project(':clients') {
 }
 
 project(':tools') {
+  group "${groupId}"
   archivesBaseName = "kafka-tools"
 
   dependencies {
@@ -710,6 +714,7 @@ project(':tools') {
 }
 
 project(':streams') {
+  group "${groupId}"
   archivesBaseName = "kafka-streams"
 
   dependencies {
@@ -759,6 +764,7 @@ project(':streams') {
 }
 
 project(':streams:examples') {
+  group "${groupId}"
   archivesBaseName = "kafka-streams-examples"
 
   dependencies {
@@ -785,6 +791,7 @@ project(':streams:examples') {
 }
 
 project(':log4j-appender') {
+  group "${groupId}"
   archivesBaseName = "kafka-log4j-appender"
 
   dependencies {
@@ -802,6 +809,7 @@ project(':log4j-appender') {
 }
 
 project(':connect:api') {
+  group "${groupId}"
   archivesBaseName = "connect-api"
 
   dependencies {
@@ -836,6 +844,7 @@ project(':connect:api') {
 }
 
 project(':connect:transforms') {
+  group "${groupId}"
   archivesBaseName = "connect-transforms"
 
   dependencies {
@@ -872,6 +881,7 @@ project(':connect:transforms') {
 }
 
 project(':connect:json') {
+  group "${groupId}"
   archivesBaseName = "connect-json"
 
   dependencies {
@@ -909,6 +919,7 @@ project(':connect:json') {
 }
 
 project(':connect:runtime') {
+  group "${groupId}"
   archivesBaseName = "connect-runtime"
 
   dependencies {
@@ -976,6 +987,7 @@ project(':connect:runtime') {
 }
 
 project(':connect:file') {
+  group "${groupId}"
   archivesBaseName = "connect-file"
 
   dependencies {
