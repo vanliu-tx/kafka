@@ -920,6 +920,7 @@ project(':connect:runtime') {
 
     compile libs.jacksonJaxrsJsonProvider
     compile libs.jerseyContainerServlet
+    compile libs.jerseyHk2
     compile libs.jettyServer
     compile libs.jettyServlet
     compile libs.jettyServlets
